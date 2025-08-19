@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+echo "== deploy  with CFN"
+
+# Variables
+STACK_NAME="Workshop-without-services-activation"
+TEMPLATE_FILE="S3AthenaWorkshopTemplate.yaml"
+
+
+aws cloudformation deploy \
+  --template-file $TEMPLATE_FILE \
+  --stack-name $STACK_NAME \
+  --capabilities CAPABILITY_NAMED_IAM \
