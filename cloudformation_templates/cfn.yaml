@@ -56,19 +56,19 @@ Metadata:
 Parameters:
   AllSupported:
     Type: String
-    Default: True
+    Default: "True"
     Description: Indicates whether to record all supported resource types.
     AllowedValues:
-      - True
-      - False
+      - "True"
+      - "False"
 
   IncludeGlobalResourceTypes:
     Type: String
-    Default: True
+    Default: "True"
     Description: Indicates whether AWS Config records all supported global resource types.
     AllowedValues:
-      - True
-      - False
+      - "True"
+      - "False"
 
   ResourceTypes:
     Type: List<String>

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+echo "== deploy  with CFN"
+
+# Variables
+STACK_NAME="Workshop"
+TEMPLATE_FILE="cfn.yaml"
+ALL_SUPPORTED="True"
+INCLUDE_GLOBAL_RESOURCE_TYPES="True"
+FREQUENCY="24hours"
+
+aws cloudformation deploy \
+  --template-file $TEMPLATE_FILE \
+  --stack-name $STACK_NAME \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    AllSupported=$ALL_SUPPORTED \
+   IncludeGlobalResourceTypes=$INCLUDE_GLOBAL_RESOURCE_TYPES \
+    Frequency=$FREQUENCY
