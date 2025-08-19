@@ -1,0 +1,466 @@
+#MIT No Attribution
+
+#Copyright 2022 Amazon Web Services Inc.
+
+#Permission is hereby granted, free of charge, to any person obtaining a copy of this
+#software and associated documentation files (the "Software"), to deal in the Software
+#without restriction, including without limitation the rights to use, copy, modify,
+#merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+#permit persons to whom the Software is furnished to do so.
+
+#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+#INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+#PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+#HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+#OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+#SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE..
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Security Hub/QuickSight/Athena workshop
+
+Resources:
+
+  SecurityHubFindingsBucket:
+    Type: 'AWS::S3::Bucket'    
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred  
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter                    
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteRawFiles
+            Prefix: raw/firehose/
+            Status: Enabled
+            ExpirationInDays: '7'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: There is no access logging needed for this workshop.
+          - id: W51
+            reason: There is no bucket policy needed for this workshop.
+          - id: W41
+            reason: There is no encryption needed for this bucket
+
+  SecurityHubCloudWatchEvent:
+    DependsOn:
+      - SecurityHubFirehose
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Exports SecurityHub findings to S3
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.securityhub
+      Targets:
+        - Arn:
+            'Fn::GetAtt':
+              - SecurityHubFirehose
+              - Arn
+          Id: FirehoseStream
+          RoleArn: !GetAtt SecurityHubLogDeliveryRole.Arn
+
+  SecurityHubLogDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'AllowSecurityHubLogDelivery'
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: securityhub_log_delivery_policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource:
+                  - !GetAtt SecurityHubFirehose.Arn                  
+  
+  LambdaFunctionKdfTransformation:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          # SPDX-License-Identifier: MIT-0
+          import base64
+          import base64
+
+          print('Loading function')
+          def lambda_handler(event, context):
+              output = []
+
+              for record in event['records']:
+                  print(record['recordId'])
+                  payload = base64.b64decode(record['data']).decode('utf-8')
+                  print('decoded payload: ' + str(payload))
+                  
+                  # Do custom processing on the payload here
+                  payload = str(payload) + '\n'
+
+                  output_record = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(payload.encode('utf-8'))
+                  }
+                  output.append(output_record)
+
+              print('Successfully processed {} records.'.format(len(event['records'])))
+              return {'records': output}
+      Handler: index.lambda_handler
+      Role: !GetAtt IAMRoleLambdaKdfTransformation.Arn
+      Runtime: python3.12
+      FunctionName: LambdaFunctionKdfTransformation
+      MemorySize: 128
+      Timeout: 300
+      Description: Lambda for Kdf Transformation
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: There is no VPC endpoint needed for this workshop. Workshop suggest some configuration compliant with best practices
+          - id: W92
+            reason: Workshop suggest some configuration compliant with best practices
+
+  IAMRoleLambdaKdfTransformation:
+    Type: AWS::IAM::Role
+    Properties:
+      #RoleName: IAMRoleLambdaKdfTransformation
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement: 
+        - Effect: Allow
+          Principal: 
+            Service: 
+              - lambda.amazonaws.com
+          Action: 
+          - sts:AssumeRole          
+  
+  SecurityHubFirehose:
+    DependsOn:
+      - SecurityHubFirehoseDeliveryPolicy
+      - SecurityHubFindingsBucket
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN:
+          !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref SecurityHubFindingsBucket
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:             
+            - Parameters: 
+              - ParameterName: LambdaArn
+                ParameterValue: !GetAtt LambdaFunctionKdfTransformation.Arn
+              Type: Lambda
+        CompressionFormat: UNCOMPRESSED
+        #Prefix: raw/firehose/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/
+        Prefix: raw/firehose/!{timestamp:yyyy}/!{timestamp:MM}/!{timestamp:dd}/
+        ErrorOutputPrefix: raw/errors/!{firehose:error-output-type}/!{timestamp:yyyy/MM/}
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+                
+  FirehoseDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'AllowFirehoseDelivery'
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+                
+  SecurityHubFirehoseDeliveryPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+            Resource:
+              - !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref SecurityHubFindingsBucket
+              - !Join 
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref SecurityHubFindingsBucket
+                  - '*'
+          - Effect: Allow
+            Action:
+              - 'lambda:InvokeFunction'
+            Resource:
+              - !GetAtt  LambdaFunctionKdfTransformation.Arn
+      Roles:
+        - !Ref FirehoseDeliveryRole
+
+  executeCreateSecurityHubDatabase:  
+    Type: Custom::executeAthenaQuery
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionExecuteQuery.Arn
+      queryoutput: !Join ["",[ "s3://", !Ref S3BucketAthenaWorkGroup, "/athena-results" ] ]
+      QueryString: 'CREATE DATABASE  IF NOT EXISTS SecurityHub; '        
+
+  executeCreateSecurityHubFindingsTable:
+    Type: Custom::executeAthenaQuery
+    DependsOn: 
+      - executeCreateSecurityHubDatabase
+      - SecurityHubFindingsBucket
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionExecuteQuery.Arn
+      queryoutput: !Join ["",[ "s3://", !Ref S3BucketAthenaWorkGroup, "/athena-results" ] ]
+      QueryString: !Join 
+        - '' 
+        - - 'CREATE EXTERNAL TABLE IF NOT EXISTS SecurityHub.securityhubfindings ( '
+          - 'id string, '
+          - ' detail struct<findings :array<struct<'
+          - ' AwsAccountId:string,'
+          - ' CreatedAt:string,'
+          - ' UpdatedAt:string,'          
+          - ' Description:string,'
+          - ' ProductArn:string,'
+          - ' GeneratorId:string,'          
+          - ' Region:string,'
+          - ' Compliance:struct<status:string>,'
+          - ' Workflow:struct<status:string>,'
+          - ' Types:string,'
+          - ' Title:string,'
+          - ' Severity:struct<Label:string>,'
+          - ' Resources:array<struct<Id:string, Type:string>>>>> )'
+          - " PARTITIONED BY ( datehour string) "
+          - " ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe' "
+          - " STORED AS INPUTFORMAT 'org.apache.hadoop.mapred.TextInputFormat' "
+          - " OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat' "
+          - " LOCATION 's3://"
+          - !Ref SecurityHubFindingsBucket
+          - "/raw' "
+          - " TBLPROPERTIES ( "
+          - " 'projection.datehour.format'='yyyy/MM/dd', "
+          - " 'projection.datehour.interval'='1', "
+          - " 'projection.datehour.interval.unit'='DAYS', "
+          - " 'projection.datehour.range'='2021/07/01,NOW', "
+          - " 'projection.datehour.type'='date', "
+          - " 'projection.enabled'='true', "
+          - " 'storage.location.template'='s3://"
+          - !Ref SecurityHubFindingsBucket
+          - "/raw/firehose/${datehour}')"
+
+  executeCreateSecurityHubFindingsView:
+    Type: Custom::executeAthenaQuery
+    DependsOn: executeCreateSecurityHubFindingsTable
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionExecuteQuery.Arn
+      queryoutput: !Join ["",[ "s3://", !Ref S3BucketAthenaWorkGroup, "/athena-results" ] ]
+      QueryString: !Join
+        - ''
+        - - 'CREATE OR REPLACE VIEW SecurityHub.securityhubfindingsview AS '
+          - ' SELECT '
+          - ' id'
+          - ', detail.findings[1].awsaccountid awsaccountid'
+          - ', CAST (substr(detail.findings[1].CreatedAt,1,10) as date) CreatedAt'
+          - ', CAST (substr(detail.findings[1].UpdatedAt,1,10) as date) UpdatedAt'         
+          - ', detail.findings[1].ProductArn ProductArn'
+          - ', detail.findings[1].GeneratorId CheckId'
+          - ', detail.findings[1].Region Region'
+          - ', detail.findings[1].Workflow.status WorflowStatus'
+          - ', detail.findings[1].Compliance.status ComplianceStatus'
+          - ', detail.findings[1].Types FindingType'
+          - ', detail.findings[1].Title FindingTitle'
+          - ', detail.findings[1].Description FindingDescription'
+          - ', detail.findings[1].Severity.Label Severity'
+          - ', detail.findings[1].Resources[1].Type ResourceType'
+          - ', detail.findings[1].Resources[1].Id ResourceId'
+          - ' FROM '
+          - ' SecurityHub.securityhubfindings '
+          - ' WHERE (detail.findings[1].awsaccountid IS NOT NULL) '
+        
+  LambdaFunctionExecuteQuery:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          # SPDX-License-Identifier: MIT-0
+          import boto3
+          import time
+          import os
+          import cfnresponse
+          from botocore.exceptions import ClientError
+          def lambda_handler(event, context):
+            if (event['RequestType'] == 'Create' or event['RequestType'] == 'Update'):
+              try:
+                client = boto3.client('athena')
+                query = event['ResourceProperties']['QueryString']
+                print(query)
+                queryoutput = event['ResourceProperties']['queryoutput']
+                response = client.start_query_execution(QueryString=query, ResultConfiguration={'OutputLocation': queryoutput}, WorkGroup=os.getenv('athena_workgroup'))
+                print(response)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as ex:
+                print(ex)
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+            else:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Handler: index.lambda_handler
+      Role: !GetAtt IAMRoleExecuteQueryAthena.Arn
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 200
+      Description: Lambda for Athena Execute Query
+      Environment:
+        Variables:
+          bucket_name: !Ref S3BucketAthenaWorkGroup
+          athena_workgroup: !Ref AthenaWorkGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: There is no VPC endpoint needed for this workshop. Workshop suggest some configuration compliant with best practices
+          - id: W92
+            reason: Workshop suggest some configuration compliant with best practices
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties: 
+      Description: Athena WorkGroup for SecurityHub
+      Name: !Sub 'Athena-WorkGroup-${AWS::StackName}'
+      RecursiveDeleteOption: True
+      State: ENABLED
+      WorkGroupConfiguration: 
+        EnforceWorkGroupConfiguration: True
+        PublishCloudWatchMetricsEnabled: True
+        RequesterPaysEnabled: False
+        ResultConfiguration: 
+          OutputLocation: !Join ['', ['s3://', !Ref 'S3BucketAthenaWorkGroup', '/athena-results/']]
+
+  IAMRoleExecuteQueryAthena:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      AssumeRolePolicyDocument: 
+        Version: '2012-10-17'
+        Statement: 
+        - Effect: Allow
+          Principal: 
+            Service: 
+              - lambda.amazonaws.com
+          Action: 
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: getS3Data
+        PolicyDocument: 
+          Version: '2012-10-17'
+          Statement: 
+          - Effect: Allow
+            Action:
+            - s3:PutObject
+            - s3:GetBucketLocation
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:ListBucketMultipartUploads
+            - s3:ListMultipartUploadParts
+            - s3:AbortMultipartUpload
+            - s3:PutObject
+            Resource:
+            - !Join ['', ['arn:aws:s3:::', !Ref S3BucketAthenaWorkGroup]]
+            - !Join ['', ['arn:aws:s3:::', !Ref S3BucketAthenaWorkGroup, '/*']]
+            - !Join ['', ['arn:aws:s3:::', !Ref SecurityHubFindingsBucket]]
+            - !Join ['', ['arn:aws:s3:::', !Ref SecurityHubFindingsBucket, '/*']]            
+          - Effect: Allow
+            Action: 
+            - glue:CreateDatabase
+            - glue:CreateTable
+            - glue:GetDatabase
+            - glue:GetDatabases
+            - glue:GetTables
+            - glue:GetTable
+            Resource:
+            - !Sub arn:aws:glue:*:${AWS::AccountId}:catalog
+            - !Sub arn:aws:glue:*:${AWS::AccountId}:database/*
+            - !Sub arn:aws:glue:*:${AWS::AccountId}:table/*/*
+      - PolicyName: queryAthena
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement: 
+          - Effect: Allow
+            Action:
+            - athena:StartQueryExecution
+            - athena:GetQueryExecution
+            - athena:GetQueryResults
+            - athena:CreateNamedQuery
+            - athena:CreateWorkGroup
+            Resource:
+            - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}'
+
+  S3BucketAthenaWorkGroup:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256                                          
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls       : True
+        BlockPublicPolicy     : True
+        IgnorePublicAcls      : True
+        RestrictPublicBuckets : True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+
+Outputs:
+  S3BucketName:
+    Description: Name of the bucket storing SecurityHub logs
+    Value: !Ref SecurityHubFindingsBucket
+    Export:
+      Name: SecurityHubFindingsBucketExportName 
+  AthenaViewSecurityHub:
+    Description: Name of the Athena view that presents SecurityHub findings
+    Value: !Ref executeCreateSecurityHubFindingsView
+    Export:
+      Name: executeCreateSecurityHubFindingsView      
