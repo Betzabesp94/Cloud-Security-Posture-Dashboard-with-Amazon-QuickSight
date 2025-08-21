@@ -10,3 +10,7 @@ As in the section [Infrastructure Deployment](https://catalog.workshops.aws/secu
 ```bash
 chmod u+x cloudformation_templates/deploy
 ```
+
+```bash
+aws securityhub get-findings --region us-east-1 > findings.json
+```
